@@ -1066,6 +1066,7 @@ void drawHUD() {
 }
 
 void setup() {
+  Serial.begin(115200);
   auto cfg = M5.config();
   StickCP2.begin(cfg);
   M5.Lcd.setRotation(0);

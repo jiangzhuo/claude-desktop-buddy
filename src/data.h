@@ -68,6 +68,10 @@ static bool _rtcValid = false;
 inline bool dataRtcValid() { return _rtcValid; }
 
 static void _applyJson(const char* line, TamaState* out) {
+#ifdef BUDDY_DUMP_RAW
+  Serial.print("[raw] ");
+  Serial.println(line);
+#endif
   JsonDocument doc;
   if (deserializeJson(doc, line)) return;
   if (xferCommand(doc)) { _lastLiveMs = millis(); return; }
