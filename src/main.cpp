@@ -88,6 +88,18 @@ bool     napping = false;
 uint32_t napStartMs = 0;
 uint32_t promptArrivedMs = 0;
 
+// AskUserQuestion: cursor position in the options list. Reset to 0 on
+// each new promptId. Clamped at render time in case the captured JSON
+// had fewer options than expected.
+uint8_t  askSel = 0;
+
+// Is the pending prompt an AskUserQuestion (with captured options)?
+static bool promptIsAsk() {
+  return tama.promptId[0]
+      && tama.askJson
+      && strcmp(tama.promptTool, "AskUserQuestion") == 0;
+}
+
 // Face-down = Z-axis dominant and negative. Debounced so a toss doesn't count.
 static bool isFaceDown() {
   float ax, ay, az;
@@ -729,6 +741,83 @@ static uint8_t wrapInto(const char* in, char* out, uint8_t stride,
   return row;
 }
 
+// AskUserQuestion full-screen selection UI. Uses the whole 135×240
+// sprite instead of the bottom 78px strip because we need room for
+// question + N options + description of the highlighted one.
+static void drawApprovalAsk() {
+  const Palette& p = characterPalette();
+  spr.fillSprite(p.bg);
+  spr.setTextSize(1);
+
+  // Timer row
+  uint32_t waited = (millis() - promptArrivedMs) / 1000;
+  spr.setTextColor(waited >= 10 ? HOT : p.textDim, p.bg);
+  spr.setCursor(4, 4);
+  spr.printf("approve? %lus", (unsigned long)waited);
+
+  JsonDocument doc;
+  if (deserializeJson(doc, tama.askJson)) {
+    spr.setTextColor(HOT, p.bg);
+    spr.setCursor(4, 20); spr.print("(askJson parse fail)");
+    return;
+  }
+  JsonVariantConst q = doc[0];
+  const char* qtext = q["question"] | "?";
+
+  // Question (up to 3 wrapped rows at 21 cols, y=16..40)
+  char qrows[3][24];
+  uint8_t qn = wrapInto(qtext, (char*)qrows, 24, 3, 21);
+  spr.setTextColor(p.text, p.bg);
+  for (uint8_t i = 0; i < qn; i++) {
+    spr.setCursor(4, 16 + i * 8);
+    spr.print(qrows[i]);
+  }
+  int optY = 16 + qn * 8 + 6;
+
+  JsonArrayConst opts = q["options"];
+  uint8_t cnt = opts.size();
+  if (cnt == 0) return;
+  uint8_t sel = askSel % cnt;
+
+  // Options (one line each, ~18 char labels fit)
+  for (uint8_t i = 0; i < cnt; i++) {
+    bool selected = (i == sel);
+    spr.setTextColor(selected ? p.text : p.textDim, p.bg);
+    spr.setCursor(4, optY + i * 12);
+    spr.print(selected ? "> " : "  ");
+    const char* lbl = opts[i]["label"] | "";
+    char lbuf[24]; snprintf(lbuf, sizeof(lbuf), "%.18s", lbl);
+    spr.print(lbuf);
+  }
+
+  // Description of the highlighted option, wrapped below the list
+  int dy = optY + cnt * 12 + 6;
+  if (dy < H - 32) {
+    const char* desc = opts[sel]["description"] | "";
+    char drows[4][24];
+    uint8_t dn = wrapInto(desc, (char*)drows, 24, 4, 21);
+    spr.setTextColor(p.body, p.bg);
+    for (uint8_t i = 0; i < dn && dy + (i + 1) * 8 < H - 16; i++) {
+      spr.setCursor(4, dy + i * 8);
+      spr.print(drows[i]);
+    }
+  }
+
+  // Footer hints. B sends decision="once" (bridge doesn't accept
+  // answers from device today) — user picks on the desktop UI;
+  // device just shows what's being asked. Label as "skip" to match
+  // actual effect.
+  if (responseSent) {
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(4, H - 12); spr.print("sent...");
+  } else {
+    spr.setTextColor(GREEN, p.bg);
+    spr.setCursor(4, H - 12); spr.print("A: next");
+    spr.setTextColor(HOT, p.bg);
+    spr.setCursor(W - 44, H - 12); spr.print("B: skip");
+  }
+}
+
 static void drawApproval() {
   const Palette& p = characterPalette();
   const int AREA = 78;
@@ -1018,7 +1107,11 @@ void drawPet() {
 }
 
 void drawHUD() {
-  if (tama.promptId[0]) { drawApproval(); return; }
+  if (tama.promptId[0]) {
+    if (promptIsAsk()) drawApprovalAsk();
+    else               drawApproval();
+    return;
+  }
   const Palette& p = characterPalette();
   const int SHOW = 3, LH = 8, WIDTH = 21;
   const int AREA = SHOW * LH + 4;
@@ -1155,6 +1248,7 @@ void loop() {
     strncpy(lastPromptId, tama.promptId, sizeof(lastPromptId)-1);
     lastPromptId[sizeof(lastPromptId)-1] = 0;
     responseSent = false;
+    askSel = 0;
     if (tama.promptId[0]) {
       promptArrivedMs = millis();
       wake();
@@ -1207,7 +1301,15 @@ void loop() {
   }
   if (M5.BtnA.wasReleased()) {
     if (!btnALong && !swallowBtnA) {
-      if (inPrompt) {
+      if (inPrompt && promptIsAsk()) {
+        // AskUserQuestion: cycle through options. Sending happens on B.
+        JsonDocument d;
+        if (deserializeJson(d, tama.askJson) == DeserializationError::Ok) {
+          uint8_t cnt = d[0]["options"].size();
+          if (cnt > 0) askSel = (askSel + 1) % cnt;
+        }
+        beep(1800, 30);
+      } else if (inPrompt) {
         char cmd[96];
         snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}", tama.promptId);
         sendCmd(cmd);
@@ -1240,7 +1342,25 @@ void loop() {
   if (M5.BtnB.wasPressed()) {
     if (swallowBtnB) { swallowBtnB = false; }
     else
-    if (inPrompt) {
+    if (inPrompt && promptIsAsk()) {
+      // AskUserQuestion confirm. The Hardware Buddy BLE bridge in
+      // Claude Desktop does not (as of 2026-04) wire up the
+      // canUseTool `updatedInput.answers` path for AskUserQuestion —
+      // tried answers:{}, decision:"answer"+answers, decision:"once"
+      // +answers, decision:"allow"+updatedInput.answers, and a new
+      // cmd:"answer" verb, all ignored. Fall back to "once" so the
+      // prompt at least resolves (empty answer); user answers on the
+      // desktop UI. The option cycle is kept as visual/future-proof:
+      // the day bridge ships a real protocol, swap the cmd body here.
+      char cmd[96];
+      snprintf(cmd, sizeof(cmd),
+               "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"once\"}",
+               tama.promptId);
+      sendCmd(cmd);
+      responseSent = true;
+      statsOnApproval((millis() - promptArrivedMs) / 1000);
+      beep(2400, 60);
+    } else if (inPrompt) {
       char cmd[96];
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
       sendCmd(cmd);

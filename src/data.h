@@ -19,6 +19,11 @@ struct TamaState {
   char     promptId[40];     // pending permission request ID; empty = no prompt
   char     promptTool[48];
   char     promptHint[1024];
+  // AskUserQuestion payload captured from the preceding evt:"turn"
+  // tool_use event. Serialized questions array (subset of the fields —
+  // see captureAskQuestions). NULL when no questions queued.
+  // Dynamically allocated so idle state costs 4B static, not 1-2KB.
+  char*    askJson;
 };
 
 // ---------------------------------------------------------------------------
@@ -67,11 +72,70 @@ inline const char* dataScenarioName() {
 static bool _rtcValid = false;
 inline bool dataRtcValid() { return _rtcValid; }
 
+// AskUserQuestion tool_use turns carry the questions+options we need
+// to render the selection UI. They arrive BEFORE the matching prompt
+// event. Use ArduinoJson's Filter feature to extract only the fields
+// we care about — this keeps DOM heap peak <2KB even when the raw
+// line has multi-KB `thinking` content we'd otherwise skip.
+static void captureAskQuestions(const char* line, TamaState* out) {
+  JsonDocument filter;
+  filter["content"][0]["input"]["questions"][0]["question"]     = true;
+  filter["content"][0]["input"]["questions"][0]["header"]       = true;
+  filter["content"][0]["input"]["questions"][0]["multiSelect"]  = true;
+  filter["content"][0]["input"]["questions"][0]["options"][0]["label"]       = true;
+  filter["content"][0]["input"]["questions"][0]["options"][0]["description"] = true;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, line,
+      DeserializationOption::Filter(filter));
+  if (err) {
+#ifdef BUDDY_DUMP_RAW
+    Serial.printf("[ask] filter parse err: %s\n", err.c_str());
+#endif
+    return;
+  }
+
+  JsonVariantConst questions = doc["content"][0]["input"]["questions"];
+  if (questions.isNull() || !questions.is<JsonArrayConst>()) return;
+
+  if (out->askJson) { free(out->askJson); out->askJson = nullptr; }
+
+  size_t need = measureJson(questions) + 1;
+  out->askJson = (char*)malloc(need);
+  if (!out->askJson) {
+#ifdef BUDDY_DUMP_RAW
+    Serial.printf("[ask] malloc %u FAILED (heap %uKB)\n",
+                  (unsigned)need, (unsigned)(ESP.getFreeHeap() / 1024));
+#endif
+    return;
+  }
+  serializeJson(questions, out->askJson, need);
+
+#ifdef BUDDY_DUMP_RAW
+  Serial.printf("[ask] captured %u bytes, %u question(s) (heap %uKB)\n",
+                (unsigned)(need - 1),
+                (unsigned)questions.size(),
+                (unsigned)(ESP.getFreeHeap() / 1024));
+#endif
+}
+
 static void _applyJson(const char* line, TamaState* out) {
 #ifdef BUDDY_DUMP_RAW
   Serial.print("[raw] ");
   Serial.println(line);
 #endif
+
+  // evt:* events are informational — they don't drive session state.
+  // AskUserQuestion turns though carry the options payload we need,
+  // so pick those out via cheap strstr before doing any JSON parsing.
+  if (strncmp(line, "{\"evt\"", 6) == 0) {
+    if (strstr(line, "\"AskUserQuestion\"")) {
+      captureAskQuestions(line, out);
+    }
+    _lastLiveMs = millis();
+    return;
+  }
+
   JsonDocument doc;
   if (deserializeJson(doc, line)) return;
   if (xferCommand(doc)) { _lastLiveMs = millis(); return; }
@@ -125,6 +189,7 @@ static void _applyJson(const char* line, TamaState* out) {
     strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
   } else {
     out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
+    if (out->askJson) { free(out->askJson); out->askJson = nullptr; }
   }
   out->lastUpdated = millis();
   _lastLiveMs = millis();
