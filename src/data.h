@@ -17,8 +17,8 @@ struct TamaState {
   uint8_t  nLines;
   uint16_t lineGen;          // bumps when lines change — lets UI reset scroll
   char     promptId[40];     // pending permission request ID; empty = no prompt
-  char     promptTool[20];
-  char     promptHint[44];
+  char     promptTool[48];
+  char     promptHint[1024];
 };
 
 // ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ struct _LineBuf {
   }
 };
 
-static _LineBuf<1024> _usbLine, _btLine;
+static _LineBuf<4096> _usbLine, _btLine;
 
 inline void dataPoll(TamaState* out) {
   uint32_t now = millis();

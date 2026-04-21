@@ -692,8 +692,12 @@ void drawInfo() {
 
 
 // Greedy word-wrap into fixed-width rows. Continuation rows get a leading
-// space. Returns number of rows written.
-static uint8_t wrapInto(const char* in, char out[][24], uint8_t maxRows, uint8_t width) {
+// space. Returns number of rows written. Runtime stride lets callers use
+// different row widths for portrait (24B rows × 21 cols) and landscape
+// (48B rows × 40 cols).
+static uint8_t wrapInto(const char* in, char* out, uint8_t stride,
+                        uint8_t maxRows, uint8_t width) {
+  auto ROW = [&](uint8_t r) -> char* { return out + (int)r * stride; };
   uint8_t row = 0, col = 0;
   const char* p = in;
   while (*p && row < maxRows) {
@@ -705,23 +709,23 @@ static uint8_t wrapInto(const char* in, char out[][24], uint8_t maxRows, uint8_t
     if (wlen == 0) break;
     uint8_t need = (col > 0 ? 1 : 0) + wlen;
     if (col + need > width) {
-      out[row][col] = 0;
+      ROW(row)[col] = 0;
       if (++row >= maxRows) return row;
-      out[row][0] = ' '; col = 1;              // continuation indent
+      ROW(row)[0] = ' '; col = 1;              // continuation indent
     }
-    if (col > 1 || (col == 1 && out[row][0] != ' ')) out[row][col++] = ' ';
+    if (col > 1 || (col == 1 && ROW(row)[0] != ' ')) ROW(row)[col++] = ' ';
     else if (col == 1 && row > 0) {}           // already have the indent space
     // hard-break words that still don't fit
     while (wlen > width - col) {
       uint8_t take = width - col;
-      memcpy(&out[row][col], w, take); col += take; w += take; wlen -= take;
-      out[row][col] = 0;
+      memcpy(&ROW(row)[col], w, take); col += take; w += take; wlen -= take;
+      ROW(row)[col] = 0;
       if (++row >= maxRows) return row;
-      out[row][0] = ' '; col = 1;
+      ROW(row)[0] = ' '; col = 1;
     }
-    memcpy(&out[row][col], w, wlen); col += wlen;
+    memcpy(&ROW(row)[col], w, wlen); col += wlen;
   }
-  if (col > 0 && row < maxRows) { out[row][col] = 0; row++; }
+  if (col > 0 && row < maxRows) { ROW(row)[col] = 0; row++; }
   return row;
 }
 
@@ -738,22 +742,38 @@ static void drawApproval() {
   if (waited >= 10) spr.setTextColor(HOT, p.bg);
   spr.printf("approve? %lus", (unsigned long)waited);
 
-  // Size 2 only if it fits one line (~10 chars at 12px on 135px screen)
+  // Tool name: size 2 when short, word-wrap to size 1 otherwise.
   int toolLen = strlen(tama.promptTool);
   spr.setTextColor(p.text, p.bg);
-  spr.setTextSize(toolLen <= 10 ? 2 : 1);
-  spr.setCursor(4, H - AREA + (toolLen <= 10 ? 14 : 18));
-  spr.print(tama.promptTool);
-  spr.setTextSize(1);
+  if (toolLen <= 10) {
+    spr.setTextSize(2);
+    spr.setCursor(4, H - AREA + 14);
+    spr.print(tama.promptTool);
+    spr.setTextSize(1);
+  } else {
+    char trows[2][24];
+    uint8_t tn = wrapInto(tama.promptTool, (char*)trows, 24, 2, 22);
+    for (uint8_t i = 0; i < tn; i++) {
+      spr.setCursor(4, H - AREA + 18 + i * 8);
+      spr.print(trows[i]);
+    }
+  }
 
-  // Hint wraps at ~21 chars to two lines under the tool name
+  // Hint: word-wrap to 2 rows of 21 chars; append ".." if truncated.
   spr.setTextColor(p.textDim, p.bg);
-  int hlen = strlen(tama.promptHint);
-  spr.setCursor(4, H - AREA + 34);
-  spr.printf("%.21s", tama.promptHint);
-  if (hlen > 21) {
-    spr.setCursor(4, H - AREA + 42);
-    spr.printf("%.21s", tama.promptHint + 21);
+  char hrows[3][24];
+  uint8_t hn = wrapInto(tama.promptHint, (char*)hrows, 24, 3, 21);
+  uint8_t shown = hn > 2 ? 2 : hn;
+  if (hn > 2) {
+    uint8_t rl = strlen(hrows[1]);
+    if (rl > 19) rl = 19;
+    hrows[1][rl++] = '.';
+    hrows[1][rl++] = '.';
+    hrows[1][rl] = 0;
+  }
+  for (uint8_t i = 0; i < shown; i++) {
+    spr.setCursor(4, H - AREA + 34 + i * 8);
+    spr.print(hrows[i]);
   }
 
   if (responseSent) {
@@ -768,6 +788,113 @@ static void drawApproval() {
     spr.setCursor(W - 48, H - 12);
     spr.print("B: deny");
   }
+}
+
+// Landscape approval: direct-to-LCD like drawClock. Fills screen only on
+// orientation transition; per-frame only repaints the waited counter and
+// the response footer. clockOrient + paintedOrient are shared with the
+// clock path but gated by landscapeApproval in the main loop so the two
+// never overlap.
+static void drawApprovalLandscape() {
+  const Palette& p = characterPalette();
+  M5.Lcd.setRotation(clockOrient);
+  static uint32_t lastWaited = 0xFFFFFFFF;
+  static bool lastSent = false;
+  static uint16_t lastToolHash = 0;
+  static uint16_t lastHintHash = 0;
+
+  bool repaint = paintedOrient != clockOrient;
+  if (repaint) {
+    M5.Lcd.fillScreen(p.bg);
+    paintedOrient = clockOrient;
+    lastWaited = 0xFFFFFFFF;
+    lastSent = !responseSent;   // force footer redraw
+    lastToolHash = 0;
+    lastHintHash = 0;
+  }
+
+  // Cheap FNV-1a over the strings to catch prompt transitions without
+  // repainting every frame. Not crypto — just a change detector.
+  auto fnv = [](const char* s) -> uint16_t {
+    uint16_t h = 0x811c;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h;
+  };
+  uint16_t toolHash = fnv(tama.promptTool);
+  uint16_t hintHash = fnv(tama.promptHint);
+
+  // Landscape layout (240×135):
+  //   y=2..10  timer "approve? Ns"    (size 1)
+  //   y=16..32 tool name              (size 2, visual anchor)
+  //   y=38..108 hint (up to 7 rows × 40 cols ≈ 280 chars)
+  //   y=120    A/B button row
+
+  // Timer row (1Hz)
+  uint32_t waited = (millis() - promptArrivedMs) / 1000;
+  if (waited != lastWaited) {
+    lastWaited = waited;
+    M5.Lcd.fillRect(0, 0, 240, 12, p.bg);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextColor(waited >= 10 ? HOT : p.textDim, p.bg);
+    M5.Lcd.setCursor(4, 2);
+    M5.Lcd.printf("approve? %lus", (unsigned long)waited);
+  }
+
+  // Tool name
+  if (toolHash != lastToolHash) {
+    lastToolHash = toolHash;
+    M5.Lcd.fillRect(0, 14, 240, 20, p.bg);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setTextColor(p.text, p.bg);
+    M5.Lcd.setCursor(4, 16);
+    M5.Lcd.print(tama.promptTool);
+    M5.Lcd.setTextSize(1);
+  }
+
+  // Hint — up to 7 rows × 40 chars (~280 chars displayable) with ".."
+  // when truncated. y=38..108 covers the 7 rows with 10px spacing.
+  if (hintHash != lastHintHash) {
+    lastHintHash = hintHash;
+    M5.Lcd.fillRect(0, 36, 240, 76, p.bg);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setTextColor(p.textDim, p.bg);
+    const uint8_t MAX_ROWS = 7;
+    char hrows[MAX_ROWS + 1][48];
+    uint8_t hn = wrapInto(tama.promptHint, (char*)hrows, 48, MAX_ROWS + 1, 40);
+    uint8_t shown = hn > MAX_ROWS ? MAX_ROWS : hn;
+    if (hn > MAX_ROWS) {
+      uint8_t rl = strlen(hrows[MAX_ROWS - 1]);
+      if (rl > 38) rl = 38;
+      hrows[MAX_ROWS - 1][rl++] = '.';
+      hrows[MAX_ROWS - 1][rl++] = '.';
+      hrows[MAX_ROWS - 1][rl] = 0;
+    }
+    for (uint8_t i = 0; i < shown; i++) {
+      M5.Lcd.setCursor(4, 38 + i * 10);
+      M5.Lcd.print(hrows[i]);
+    }
+  }
+
+  // Footer
+  if (responseSent != lastSent) {
+    lastSent = responseSent;
+    M5.Lcd.fillRect(0, 115, 240, 14, p.bg);
+    M5.Lcd.setTextSize(1);
+    if (responseSent) {
+      M5.Lcd.setTextColor(p.textDim, p.bg);
+      M5.Lcd.setCursor(4, 120);
+      M5.Lcd.print("sent...");
+    } else {
+      M5.Lcd.setTextColor(GREEN, p.bg);
+      M5.Lcd.setCursor(4, 120);
+      M5.Lcd.print("A: approve");
+      M5.Lcd.setTextColor(HOT, p.bg);
+      M5.Lcd.setCursor(240 - 52, 120);
+      M5.Lcd.print("B: deny");
+    }
+  }
+
+  M5.Lcd.setRotation(0);
 }
 
 static void tinyHeart(int x, int y, bool filled, uint16_t col) {
@@ -913,7 +1040,7 @@ void drawHUD() {
   static uint8_t srcOf[32];
   uint8_t nDisp = 0;
   for (uint8_t i = 0; i < tama.nLines && nDisp < 32; i++) {
-    uint8_t got = wrapInto(tama.lines[i], &disp[nDisp], 32 - nDisp, WIDTH);
+    uint8_t got = wrapInto(tama.lines[i], (char*)&disp[nDisp], 24, 32 - nDisp, WIDTH);
     for (uint8_t j = 0; j < got; j++) srcOf[nDisp + j] = i;
     nDisp += got;
   }
@@ -1154,9 +1281,22 @@ void loop() {
                && !menuOpen && !settingsOpen && !resetOpen && !inPrompt
                && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
                && dataRtcValid() && _onUsb;
-  if (clocking) clockUpdateOrient();
-  else { clockOrient = 0; orientFrames = 0; paintedOrient = 0; }
-  bool landscapeClock = clocking && clockOrient != 0;
+  // Orientation detection runs whenever a landscape-capable screen is
+  // active. Today that's charging-clock and any pending approval
+  // (including the brief "sent..." tail after the user decides but
+  // before the desktop clears promptId). Those two are mutually
+  // exclusive by construction — clocking requires !inPrompt.
+  bool approvalUp = tama.promptId[0];
+  bool orientTracked = clocking || approvalUp;
+  if (orientTracked) clockUpdateOrient();
+  else { clockOrient = 0; orientFrames = 0; }
+  // Always clear paintedOrient when we're in portrait — drawClock does
+  // this in its own portrait branch, but the approval portrait path
+  // runs via sprite and would otherwise leave paintedOrient stale, so
+  // the next landscape entry skips its repaint and shows a blank frame.
+  if (clockOrient == 0) paintedOrient = 0;
+  bool landscapeClock    = clocking && clockOrient != 0;
+  bool landscapeApproval = approvalUp && clockOrient != 0;
 
   static bool wasClocking = false;
   static bool wasLandscape = false;
@@ -1188,9 +1328,9 @@ void loop() {
   if (pk && !lastPasskey) { wake(); beep(1800, 60); }
   lastPasskey = pk;
 
-  if (napping || screenOff || landscapeClock) {
-    // skip sprite render — face-down, powered off, or landscape clock
-    // (which draws direct-to-LCD below)
+  if (napping || screenOff || landscapeClock || landscapeApproval) {
+    // skip sprite render — face-down, powered off, or a direct-to-LCD
+    // landscape screen is about to paint (clock or approval)
   } else if (buddyMode) {
     buddyTick(activeState);
   } else if (characterLoaded()) {
@@ -1220,6 +1360,8 @@ void loop() {
   }
   if (landscapeClock) {
     drawClock();
+  } else if (landscapeApproval) {
+    drawApprovalLandscape();
   } else if (!napping && !screenOff) {
     if (blePasskey()) drawPasskey();
     else if (clocking) drawClock();
