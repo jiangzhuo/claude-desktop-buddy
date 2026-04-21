@@ -4,6 +4,7 @@
 #include "ble_bridge.h"
 #include "data.h"
 #include "buddy.h"
+#include "power.h"
 
 M5Canvas spr(&M5.Lcd);
 
@@ -95,7 +96,7 @@ static bool isFaceDown() {
 }
 
 // brightLevel 0..4 → 51, 102, 153, 204, 255 on the 0..255 panel scale.
-static void applyBrightness() { M5.Display.setBrightness((20 + brightLevel * 20) * 255 / 100); }
+static void applyBrightness() { M5.Display.setBrightness((brightLevel + 1) * 51); }
 
 static void wake() {
   lastInteractMs = millis();
@@ -597,8 +598,7 @@ void drawInfo() {
     int vBat_mV = M5.Power.getBatteryVoltage();
     int iBat_mA = (int)M5.Power.getBatteryCurrent();
     int vBus_mV = M5.Power.getVBUSVoltage();
-    int pct = (vBat_mV - 3200) / 10;   // (v-3.2)/(4.2-3.2)*100 = (v-3.2)*100 = (mv-3200)/10
-    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    int pct = batteryPercent(vBat_mV);
     bool usb = M5.Power.isCharging() || vBus_mV > 4000;
     bool charging = usb && iBat_mA > 1;
     bool full = usb && vBat_mV > 4100 && iBat_mA < 10;
