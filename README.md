@@ -1,4 +1,9 @@
-# claude-desktop-buddy
+# claude-desktop-buddy (M5StickC Plus2 fork)
+
+> **Fork note:** This fork ports the firmware from M5StickC Plus (AXP192
+> PMU + TFT_eSPI) to **M5StickC Plus2** (no PMU, M5Unified + M5GFX). See
+> [Fork changes](#fork-changes-m5stickc-plus--plus2) below for what was
+> modified. Upstream: [anthropics/claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy).
 
 Claude for macOS and Windows can connect Claude Cowork and Claude Code to
 maker devices over BLE, so developers and makers can build hardware that
@@ -17,15 +22,15 @@ wakes when sessions start, gets visibly impatient when an approval prompt is
 waiting, and lets you approve or deny right from the device.
 
 <p align="center">
-  <img src="docs/device.jpg" alt="M5StickC Plus running the buddy firmware" width="500">
+  <img src="docs/device.jpg" alt="M5StickC Plus2 running the buddy firmware" width="500">
 </p>
 
 ## Hardware
 
 The firmware targets ESP32 with the Arduino framework. As written, it
-depends on the M5StickCPlus library for its display, IMU, and button
-drivers—so you'll need that board, or a fork that swaps those drivers for
-your own pin layout.
+depends on the M5StickCPlus2 library (M5Unified + M5GFX) for its display,
+IMU, and button drivers—so you'll need that board, or a fork that swaps
+those drivers for your own pin layout.
 
 ## Flashing
 
@@ -170,3 +175,52 @@ tools/           — generators and converters
 The BLE API is only available when the desktop apps are in developer mode
 (**Help → Troubleshooting → Enable Developer Mode**). It's intended for
 makers and developers and isn't an officially supported product feature.
+
+## Fork changes (M5StickC Plus → Plus2)
+
+The Plus2 swaps out the AXP192 PMU, uses a different display panel
+(ST7789 135×240 vs. the original's SH1107 80×160 path), and ships with
+the newer M5Unified + M5GFX stack instead of the legacy TFT_eSPI one.
+This fork adapts the firmware accordingly. Summary of changes:
+
+- **`platformio.ini`** — env renamed to `m5stickc-plus2`; library
+  swapped to `m5stack/M5StickCPlus2`; 8 MB flash size; `lib_ignore =
+  DFRobot_GP8XXX` (broken transitive dep that uses an old
+  `analogWriteResolution` signature); `build_unflags =
+  -DARDUINO_M5Stick_C` to strip the define injected by the
+  `m5stick-c` board JSON — without this, M5Unified's `#if / #elif`
+  board-detection chain matches the original M5StickC first and never
+  reaches Plus2, resulting in a black screen; `build_flags` adds
+  `-DARDUINO_M5STICK_C_PLUS2`.
+- **Headers** — `#include <M5StickCPlus.h>` → `#include
+  <M5StickCPlus2.h>` across all sources.
+- **Graphics** — `TFT_eSprite` → `M5Canvas`, `TFT_eSPI*` →
+  `LovyanGFX*` for the render-target indirection in `buddy.cpp` /
+  `character.cpp`. Sprite constructed as `M5Canvas spr(&M5.Lcd);`.
+- **Power** (no AXP192 on Plus2) — `M5.Axp.PowerOff()` →
+  `M5.Power.powerOff()`; `M5.Axp.GetBatVoltage()/GetBatCurrent()/
+  GetVBusVoltage()` → `M5.Power.getBatteryVoltage()/
+  getBatteryCurrent()/ getVBUSVoltage()` (now in mV/mA, no `× 1000`);
+  USB presence falls back to `M5.Power.isCharging()`; screen-off via
+  `M5.Display.sleep()` / `wakeup()` instead of `M5.Axp.SetLDO2()`;
+  brightness via `M5.Display.setBrightness(0–255)` instead of
+  `ScreenBreath(0–100)`; chip temperature dropped (no AXP), replaced
+  by `M5.Imu.getTemp()`.
+- **Buttons** — the AXP power-button short-press check
+  `M5.Axp.GetBtnPress() == 0x02` → `M5.BtnPWR.wasClicked()`.
+- **Audio** — `M5.Beep.tone()` → `M5.Speaker.tone()`; the per-loop
+  `M5.Beep.update()` call is removed (the M5Unified speaker is
+  DMA-driven and doesn't need it).
+- **IMU** — `M5.Imu.Init()` → `M5.Imu.begin()`. `getAccelData()` still
+  works as a compat alias on M5Unified.
+- **RTC** — `RTC_TimeTypeDef` / `RTC_DateTypeDef` →
+  `m5::rtc_time_t` / `m5::rtc_date_t`; struct members switched from
+  CamelCase (`Hours`, `Minutes`, `Seconds`, `Year`, `Month`, `Date`,
+  `WeekDay`) to lowercase (`hours`, `minutes`, `seconds`, `year`,
+  `month`, `date`, `weekDay`); `GetTime` / `SetTime` etc. →
+  `getTime` / `setTime`.
+- **setup()** — now uses `auto cfg = M5.config(); StickCP2.begin(cfg);`
+  per the M5StickCPlus2 example.
+
+Flashing, pairing, controls, pets, and everything else work the same
+as upstream.
