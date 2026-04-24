@@ -3,6 +3,8 @@
 #include <LittleFS.h>
 #include <AnimatedGIF.h>
 #include <ArduinoJson.h>
+#include "psram_util.h"
+#include "safe_log.h"
 
 extern M5Canvas spr;
 
@@ -18,7 +20,10 @@ struct TextState {
   uint8_t  nFrames;
   uint16_t delayMs;
 };
-static TextState textStates[N_STATES];
+// textStates[] and gifPaths[] live in PSRAM — both are large-ish tables
+// only populated when a character is installed. Lazily allocated in
+// characterInit(). Sizeof(textStates) ≈ 1.1 KB, sizeof(gifPaths) = 1 KB.
+static TextState* textStates = nullptr;
 static bool      textMode = false;
 static uint8_t   textFrame = 0;
 static uint32_t  textNext = 0;
@@ -27,12 +32,25 @@ static bool    loaded = false;
 static Palette pal = { 0xC2A6, 0x0000, 0xFFFF, 0x8410, 0x0000 };
 static char    basePath[48];
 static const uint8_t MAX_GIFS = 32;
-static char    gifPaths[MAX_GIFS][32];
+static char  (*gifPaths)[32] = nullptr;
 static uint8_t stateStart[N_STATES];
 static uint8_t stateCount[N_STATES];
 static uint8_t stateRot[N_STATES];
 static uint8_t gifTotal = 0;
 static uint8_t curState = 0xFF;
+
+static void ensureCharTables() {
+  if (!textStates) textStates = (TextState*)psCalloc(N_STATES, sizeof(TextState));
+  if (!gifPaths)   gifPaths   = (char (*)[32])psCalloc(MAX_GIFS, 32);
+}
+
+// Called explicitly at setup before any NVS / LittleFS read. Keeps all
+// PSRAM allocation ahead of the first flash op — flash reads briefly
+// disable PSRAM cache, which corrupts TLSF free-list metadata if any
+// later psCalloc tries to walk it.
+void characterPreallocTables() {
+  ensureCharTables();
+}
 
 static AnimatedGIF gif;
 static File        gifFile;
@@ -138,10 +156,15 @@ static void gifDrawCb(GIFDRAW* d) {
 // --- Public -------------------------------------------------------------
 
 bool characterInit(const char* name) {
+  ensureCharTables();
+  if (!textStates || !gifPaths) {
+    LOGLN("[char] PSRAM alloc failed");
+    return false;
+  }
   if (!LittleFS.begin(false)) {
     // begin() fails if already mounted — that's fine on reload
     if (!LittleFS.open("/")) {
-      Serial.println("[char] LittleFS mount failed");
+      LOGLN("[char] LittleFS mount failed");
       return false;
     }
   }
@@ -165,7 +188,7 @@ bool characterInit(const char* name) {
       }
       d.close();
     }
-    if (!name) { Serial.println("[char] no characters installed"); return false; }
+    if (!name) { LOGLN("[char] no characters installed"); return false; }
   }
 
   snprintf(basePath, sizeof(basePath), "/characters/%s", name);
@@ -174,15 +197,15 @@ bool characterInit(const char* name) {
 
   File mf = LittleFS.open(mpath, "r");
   if (!mf) {
-    Serial.printf("[char] manifest not found: %s\n", mpath);
+    LOGF("[char] manifest not found: %s\n", mpath);
     return false;
   }
 
-  JsonDocument doc;
+  JsonDocument doc(&psramJsonAllocator());
   DeserializationError err = deserializeJson(doc, mf);
   mf.close();
   if (err) {
-    Serial.printf("[char] manifest parse: %s\n", err.c_str());
+    LOGF("[char] manifest parse: %s\n", err.c_str());
     return false;
   }
 
@@ -216,7 +239,7 @@ bool characterInit(const char* name) {
       }
     }
     loaded = true;
-    Serial.printf("[char] loaded '%s' (text mode, %d states)\n", name, N_STATES);
+    LOGF("[char] loaded '%s' (text mode, %d states)\n", name, N_STATES);
     return true;
   }
 
@@ -240,7 +263,7 @@ bool characterInit(const char* name) {
 
   gif.begin(LITTLE_ENDIAN_PIXELS);
   loaded = true;
-  Serial.printf("[char] loaded '%s' from %s\n", (const char*)doc["name"], basePath);
+  LOGF("[char] loaded '%s' from %s\n", (const char*)doc["name"], basePath);
   return true;
 }
 
@@ -308,7 +331,7 @@ void characterSetState(uint8_t s) {
   curState = s;
 
   if (stateCount[s] == 0) {
-    Serial.printf("[char] no gif for state %d\n", s);
+    LOGF("[char] no gif for state %d\n", s);
     return;
   }
 
@@ -323,10 +346,10 @@ void characterSetState(uint8_t s) {
     spr.fillSprite(pal.bg);   // bias upward, leave room for HUD
     nextFrameAt = 0;
     variantStartedMs = millis();
-    Serial.printf("[char] %s: %dx%d @ (%d,%d) heap=%u\n",
+    LOGF("[char] %s: %dx%d @ (%d,%d) heap=%u\n",
       gifPaths[idx], gifW, gifH, gifX, gifY, ESP.getFreeHeap());
   } else {
-    Serial.printf("[char] open failed: %s (err %d)\n", full, gif.getLastError());
+    LOGF("[char] open failed: %s (err %d)\n", full, gif.getLastError());
   }
 }
 

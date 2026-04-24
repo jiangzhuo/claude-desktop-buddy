@@ -5,6 +5,7 @@
 #include <mbedtls/base64.h>
 #include <ArduinoJson.h>
 #include "power.h"
+#include "safe_log.h"
 
 static File     _xFile;
 static uint32_t _xExpected = 0, _xWritten = 0;
@@ -18,7 +19,7 @@ static uint32_t _xTotal = 0, _xTotalWritten = 0;
 static void _xAck(const char* what, bool ok, uint32_t n = 0) {
   char b[64];
   int len = snprintf(b, sizeof(b), "{\"ack\":\"%s\",\"ok\":%s,\"n\":%lu}\n", what, ok?"true":"false", (unsigned long)n);
-  Serial.write(b, len);
+  LOGWRITE(b, len);
   bleWrite((const uint8_t*)b, len);
 }
 
@@ -117,23 +118,30 @@ inline bool xferCommand(JsonDocument& doc) {
     int iBat = (int)M5.Power.getBatteryCurrent();
     int vBus = M5.Power.getVBUSVoltage();
     int pct = batteryPercent(vBat);
-    char b[320];
+    // PSRAM values come from the boot-time snapshot (see main.cpp) —
+    // live heap_caps walks are unsafe post-BLE on this chip.
+    extern size_t g_psramTotalCached;
+    extern size_t g_psramFreeAtBoot;
+    char b[384];
     int len = snprintf(b, sizeof(b),
       "{\"ack\":\"status\",\"ok\":true,\"n\":0,\"data\":{"
       "\"name\":\"%s\",\"owner\":\"%s\",\"sec\":%s,"
       "\"bat\":{\"pct\":%d,\"mV\":%d,\"mA\":%d,\"usb\":%s},"
-      "\"sys\":{\"up\":%lu,\"heap\":%u,\"fsFree\":%lu,\"fsTotal\":%lu},"
+      "\"sys\":{\"up\":%lu,\"heap\":%u,\"psram\":%u,\"psramUsed\":%u,"
+              "\"fsFree\":%lu,\"fsTotal\":%lu},"
       "\"stats\":{\"appr\":%u,\"deny\":%u,\"vel\":%u,\"nap\":%lu,\"lvl\":%u}"
       "}}\n",
       petName(), ownerName(), bleSecure() ? "true" : "false",
       pct, vBat, iBat, (vBus > 4000) ? "true" : "false",
       millis() / 1000, ESP.getFreeHeap(),
+      (unsigned)g_psramTotalCached,
+      (unsigned)(g_psramTotalCached - g_psramFreeAtBoot),
       (unsigned long)(LittleFS.totalBytes() - LittleFS.usedBytes()),
       (unsigned long)LittleFS.totalBytes(),
       stats().approvals, stats().denials, statsMedianVelocity(),
       (unsigned long)stats().napSeconds, stats().level
     );
-    Serial.write(b, len);
+    LOGWRITE(b, len);
     bleWrite((const uint8_t*)b, len);
     return true;
   }
@@ -169,7 +177,7 @@ inline bool xferCommand(JsonDocument& doc) {
         "{\"ack\":\"char_begin\",\"ok\":false,\"n\":%lu,\"error\":\"need %luK, have %luK\"}\n",
         (unsigned long)available, (unsigned long)(_xTotal/1024), (unsigned long)(available/1024)
       );
-      Serial.write(b, len);
+      LOGWRITE(b, len);
       bleWrite((const uint8_t*)b, len);
       return true;
     }

@@ -30,3 +30,8 @@ void bleClearBonds();
 size_t bleAvailable();
 int bleRead();
 size_t bleWrite(const uint8_t* data, size_t len);
+// Prints deferred logs (connect/disconnect/MTU/auth/passkey) that were
+// captured inside BLE callbacks. Callbacks run on the NimBLE host task
+// (core 0) where touching Serial races with the main UART driver state;
+// the main loop calls this every tick to emit them safely from core 1.
+void bleDrainEvents();

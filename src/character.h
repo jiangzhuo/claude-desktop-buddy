@@ -5,6 +5,12 @@ struct Palette {
   uint16_t body, bg, text, textDim, ink;
 };
 
+// Preallocate the PSRAM tables characterInit() will populate (text
+// states + gif paths). Must be called BEFORE any NVS / LittleFS read
+// at boot — flash reads disable PSRAM cache transiently and leave the
+// TLSF free-list unsafe to walk for the rest of the uptime.
+void characterPreallocTables();
+
 // Call after M5.begin() and spr.createSprite(). Mounts LittleFS, reads
 // /characters/<name>/manifest.json, parses colors, caches GIF paths.
 bool characterInit(const char* name);

@@ -5,8 +5,47 @@
 #include "data.h"
 #include "buddy.h"
 #include "power.h"
+#include "ui_text.h"
+#include "safe_log.h"
+
+volatile bool g_uartAlive = true;
+
+// PSRAM arena globals (see psram_util.h).
+uint8_t* g_psArenaBase = nullptr;
+size_t   g_psArenaCap  = 0;
+size_t   g_psArenaUsed = 0;
+uint8_t* g_psArenaLastPtr = nullptr;
+
+// Dedicated pre-BLE PSRAM buffer for askJson — lives for the life of
+// the firmware, reused for each AskUserQuestion capture.
+char*  g_askJsonBuf = nullptr;
+size_t g_askJsonCap = 0;
+
+// Cached at boot before BLE init — the live heap_caps_get_info() would
+// walk the corrupt PSRAM free list post-BLE. Reported by info pages
+// and the status xfer command (xfer.h declares matching externs).
+size_t g_psramTotalCached = 0;
+size_t g_psramFreeAtBoot = 0;
 
 M5Canvas spr(&M5.Lcd);
+
+// HUD scratch buffers in PSRAM — allocated in hudPrealloc() before BLE
+// init. Post-BLE PSRAM malloc is unsafe; these are used for the lifetime
+// of the firmware so there's no need to free them.
+//
+// At 48-byte stride we fit ~15 CJK glyphs per wrapped row. 128 rows at
+// 15 glyphs = ~1920 characters of transcript history expandable via
+// scroll — plenty for a few hundred-character bridge messages plus
+// surrounding context lines.
+static const uint8_t HUD_MAX_ROWS = 128;
+static const uint8_t HUD_ROW_STRIDE = 48;
+
+char     (*g_hudDisp)[HUD_ROW_STRIDE] = nullptr;
+uint8_t* g_hudSrcOf = nullptr;
+static void hudPrealloc() {
+  if (!g_hudDisp)  g_hudDisp  = (char (*)[HUD_ROW_STRIDE])psAlloc(HUD_MAX_ROWS * HUD_ROW_STRIDE);
+  if (!g_hudSrcOf) g_hudSrcOf = (uint8_t*)psAlloc(HUD_MAX_ROWS);
+}
 
 // Advertise as "Claude-XXXX" (last two BT MAC bytes) so multiple sticks
 // in one room are distinguishable in the desktop picker. Name persists in
@@ -46,6 +85,7 @@ bool    menuOpen    = false;
 uint8_t menuSel     = 0;
 uint8_t brightLevel = 4;           // 0..4 → ScreenBreath 20..100
 bool    btnALong    = false;
+bool    btnBLong    = false;
 
 enum DisplayMode { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_COUNT };
 uint8_t displayMode = DISP_NORMAL;
@@ -127,7 +167,7 @@ static void beep(uint16_t freq, uint16_t dur) {
 }
 
 static void sendCmd(const char* json) {
-  Serial.println(json);
+  LOGLN(json);
   size_t n = strlen(json);
   bleWrite((const uint8_t*)json, n);
   bleWrite((const uint8_t*)"\n", 1);
@@ -153,8 +193,8 @@ const uint8_t MENU_N = 6;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
-const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
-const uint8_t SETTINGS_N = 10;
+const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "jp font", "cn font", "kr font", "clock rot", "ascii pet", "reset", "back" };
+const uint8_t SETTINGS_N = 13;
 
 bool    resetOpen = false;
 uint8_t resetSel  = 0;
@@ -181,10 +221,13 @@ static void applySetting(uint8_t idx) {
     case 3: s.wifi = !s.wifi; break;   // stored only — no WiFi stack linked
     case 4: s.led = !s.led; break;
     case 5: s.hud = !s.hud; break;
-    case 6: s.clockRot = (s.clockRot + 1) % 3; break;
-    case 7: nextPet(); return;
-    case 8: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-    case 9: settingsOpen = false; characterInvalidate(); return;
+    case 6: s.cjkJa = !s.cjkJa; uiSetCjkRoute(s.cjkJa, s.cjkCn, s.cjkKr); break;
+    case 7: s.cjkCn = !s.cjkCn; uiSetCjkRoute(s.cjkJa, s.cjkCn, s.cjkKr); break;
+    case 8: s.cjkKr = !s.cjkKr; uiSetCjkRoute(s.cjkJa, s.cjkCn, s.cjkKr); break;
+    case 9:  s.clockRot = (s.clockRot + 1) % 3; break;
+    case 10: nextPet(); return;
+    case 11: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+    case 12: settingsOpen = false; characterInvalidate(); return;
   }
   settingsSave();
 }
@@ -270,7 +313,7 @@ static void drawSettings() {
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
   spr.setTextSize(1);
   Settings& s = settings();
-  bool vals[] = { s.sound, s.bt, s.wifi, s.led, s.hud };
+  bool vals[] = { s.sound, s.bt, s.wifi, s.led, s.hud, s.cjkJa, s.cjkCn, s.cjkKr };
   for (int i = 0; i < SETTINGS_N; i++) {
     bool sel = (i == settingsSel);
     spr.setTextColor(sel ? p.text : p.textDim, PANEL);
@@ -281,13 +324,13 @@ static void drawSettings() {
     spr.setTextColor(p.textDim, PANEL);
     if (i == 0) {
       spr.printf("%u/4", brightLevel);
-    } else if (i >= 1 && i <= 5) {
+    } else if (i >= 1 && i <= 8) {
       spr.setTextColor(vals[i-1] ? GREEN : p.textDim, PANEL);
       spr.print(vals[i-1] ? " on" : "off");
-    } else if (i == 6) {
+    } else if (i == 9) {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
-    } else if (i == 7) {
+    } else if (i == 10) {
       uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
       uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
       spr.printf("%u/%u", pos, total);
@@ -638,6 +681,16 @@ void drawInfo() {
     uint32_t up = millis() / 1000;
     ln("  uptime   %luh %02lum", up / 3600, (up / 60) % 60);
     ln("  heap     %uKB", ESP.getFreeHeap() / 1024);
+    // PSRAM stats snapshot from before BLE started (live heap walk
+    // post-BLE would crash on the corrupted free-list). Arena usage
+    // is tracked by us directly, safe to read any time.
+    if (g_psramTotalCached > 0) {
+      ln("  psram    %u/%uKB",
+         (unsigned)((g_psramTotalCached - g_psramFreeAtBoot) / 1024),
+         (unsigned)(g_psramTotalCached / 1024));
+      ln("  ps-arena %u/%uB",
+         (unsigned)psArenaUsed(), (unsigned)psArenaCapacity());
+    }
     ln("  bright   %u/4", brightLevel);
     ln("  bt       %s", settings().bt ? (dataBtActive() ? "linked" : "on") : "off");
     float imuTemp = 0.0f;
@@ -755,7 +808,7 @@ static void drawApprovalAsk() {
   spr.setCursor(4, 4);
   spr.printf("approve? %lus", (unsigned long)waited);
 
-  JsonDocument doc;
+  JsonDocument doc;   // runtime parse → internal heap
   if (deserializeJson(doc, tama.askJson)) {
     spr.setTextColor(HOT, p.bg);
     spr.setCursor(4, 20); spr.print("(askJson parse fail)");
@@ -764,42 +817,54 @@ static void drawApprovalAsk() {
   JsonVariantConst q = doc[0];
   const char* qtext = q["question"] | "?";
 
-  // Question (up to 3 wrapped rows at 21 cols, y=16..40)
-  char qrows[3][24];
-  uint8_t qn = wrapInto(qtext, (char*)qrows, 24, 3, 21);
-  spr.setTextColor(p.text, p.bg);
-  for (uint8_t i = 0; i < qn; i++) {
-    spr.setCursor(4, 16 + i * 8);
-    spr.print(qrows[i]);
-  }
-  int optY = 16 + qn * 8 + 6;
-
   JsonArrayConst opts = q["options"];
   uint8_t cnt = opts.size();
   if (cnt == 0) return;
   uint8_t sel = askSel % cnt;
 
-  // Options (one line each, ~18 char labels fit)
-  for (uint8_t i = 0; i < cnt; i++) {
-    bool selected = (i == sel);
-    spr.setTextColor(selected ? p.text : p.textDim, p.bg);
-    spr.setCursor(4, optY + i * 12);
-    spr.print(selected ? "> " : "  ");
-    const char* lbl = opts[i]["label"] | "";
-    char lbuf[24]; snprintf(lbuf, sizeof(lbuf), "%.18s", lbl);
-    spr.print(lbuf);
-  }
+  // User-originated text (question, option labels, description) uses the
+  // CJK font; scope it so the footer below keeps the default 6x8 ASCII font.
+  {
+    UiCjkFont uf(&spr);
+    const uint16_t TEXT_PX  = W - 8;
+    const uint16_t LABEL_PX = W - 8 - 12;   // after "> " prefix
 
-  // Description of the highlighted option, wrapped below the list
-  int dy = optY + cnt * 12 + 6;
-  if (dy < H - 32) {
-    const char* desc = opts[sel]["description"] | "";
-    char drows[4][24];
-    uint8_t dn = wrapInto(desc, (char*)drows, 24, 4, 21);
-    spr.setTextColor(p.body, p.bg);
-    for (uint8_t i = 0; i < dn && dy + (i + 1) * 8 < H - 16; i++) {
-      spr.setCursor(4, dy + i * 8);
-      spr.print(drows[i]);
+    // Question (up to 3 wrapped rows at UI_CJK_LH pitch).
+    char qrows[3][64];
+    uint8_t qn = uiWrapUtf8(&spr, qtext, (char*)qrows, 64, 3, TEXT_PX);
+    spr.setTextColor(p.text, p.bg);
+    for (uint8_t i = 0; i < qn; i++) {
+      spr.setCursor(4, 16 + i * UI_CJK_LH);
+      uiPrintUtf8(&spr, qrows[i]);
+    }
+    int optY = 16 + qn * UI_CJK_LH + 6;
+
+    // Options: single line per option, ellipsize to fit.
+    const uint16_t OPT_LH = UI_CJK_LH + 2;
+    for (uint8_t i = 0; i < cnt; i++) {
+      bool selected = (i == sel);
+      spr.setTextColor(selected ? p.text : p.textDim, p.bg);
+      spr.setCursor(4, optY + i * OPT_LH);
+      uiPrintUtf8(&spr, selected ? "> " : "  ");
+      const char* lbl = opts[i]["label"] | "";
+      char lbuf[64];
+      strncpy(lbuf, lbl, sizeof(lbuf) - 1);
+      lbuf[sizeof(lbuf) - 1] = 0;
+      if (uiTextWidthUtf8(&spr, lbuf) > LABEL_PX) uiEllipsize(&spr, lbuf, sizeof(lbuf), LABEL_PX);
+      uiPrintUtf8(&spr, lbuf);
+    }
+
+    // Description of the highlighted option, wrapped below the list.
+    int dy = optY + cnt * OPT_LH + 6;
+    if (dy < H - 32) {
+      const char* desc = opts[sel]["description"] | "";
+      char drows[4][64];
+      uint8_t dn = uiWrapUtf8(&spr, desc, (char*)drows, 64, 4, TEXT_PX);
+      spr.setTextColor(p.body, p.bg);
+      for (uint8_t i = 0; i < dn && dy + (int)(i + 1) * UI_CJK_LH < H - 16; i++) {
+        spr.setCursor(4, dy + i * UI_CJK_LH);
+        uiPrintUtf8(&spr, drows[i]);
+      }
     }
   }
 
@@ -848,21 +913,20 @@ static void drawApproval() {
     }
   }
 
-  // Hint: word-wrap to 2 rows of 21 chars; append ".." if truncated.
-  spr.setTextColor(p.textDim, p.bg);
-  char hrows[3][24];
-  uint8_t hn = wrapInto(tama.promptHint, (char*)hrows, 24, 3, 21);
-  uint8_t shown = hn > 2 ? 2 : hn;
-  if (hn > 2) {
-    uint8_t rl = strlen(hrows[1]);
-    if (rl > 19) rl = 19;
-    hrows[1][rl++] = '.';
-    hrows[1][rl++] = '.';
-    hrows[1][rl] = 0;
-  }
-  for (uint8_t i = 0; i < shown; i++) {
-    spr.setCursor(4, H - AREA + 34 + i * 8);
-    spr.print(hrows[i]);
+  // Hint: CJK-aware word-wrap to 2 visible rows; ellipsize row 1 if the
+  // wrap would have continued onto a third row.
+  {
+    UiCjkFont uf(&spr);
+    const uint16_t HINT_PX = W - 8;
+    spr.setTextColor(p.textDim, p.bg);
+    char hrows[3][64];
+    uint8_t hn = uiWrapUtf8(&spr, tama.promptHint, (char*)hrows, 64, 3, HINT_PX);
+    uint8_t shown = hn > 2 ? 2 : hn;
+    if (hn > 2) uiEllipsize(&spr, hrows[1], 64, HINT_PX);
+    for (uint8_t i = 0; i < shown; i++) {
+      spr.setCursor(4, H - AREA + 34 + i * UI_CJK_LH);
+      uiPrintUtf8(&spr, hrows[i]);
+    }
   }
 
   if (responseSent) {
@@ -940,27 +1004,23 @@ static void drawApprovalLandscape() {
     M5.Lcd.setTextSize(1);
   }
 
-  // Hint — up to 7 rows × 40 chars (~280 chars displayable) with ".."
-  // when truncated. y=38..108 covers the 7 rows with 10px spacing.
+  // Hint — CJK-aware wrap. Landscape has 72 vertical px (y=36..108) for the
+  // hint. At UI_CJK_LH=15px that fits 4 rows. Wider max width accommodates
+  // up to ~28 CJK glyphs or ~56 ASCII per row.
   if (hintHash != lastHintHash) {
     lastHintHash = hintHash;
     M5.Lcd.fillRect(0, 36, 240, 76, p.bg);
-    M5.Lcd.setTextSize(1);
+    UiCjkFont uf(&M5.Lcd);
     M5.Lcd.setTextColor(p.textDim, p.bg);
-    const uint8_t MAX_ROWS = 7;
-    char hrows[MAX_ROWS + 1][48];
-    uint8_t hn = wrapInto(tama.promptHint, (char*)hrows, 48, MAX_ROWS + 1, 40);
+    const uint8_t  MAX_ROWS = 4;
+    const uint16_t HINT_PX  = 240 - 8;
+    char hrows[MAX_ROWS + 1][96];
+    uint8_t hn = uiWrapUtf8(&M5.Lcd, tama.promptHint, (char*)hrows, 96, MAX_ROWS + 1, HINT_PX);
     uint8_t shown = hn > MAX_ROWS ? MAX_ROWS : hn;
-    if (hn > MAX_ROWS) {
-      uint8_t rl = strlen(hrows[MAX_ROWS - 1]);
-      if (rl > 38) rl = 38;
-      hrows[MAX_ROWS - 1][rl++] = '.';
-      hrows[MAX_ROWS - 1][rl++] = '.';
-      hrows[MAX_ROWS - 1][rl] = 0;
-    }
+    if (hn > MAX_ROWS) uiEllipsize(&M5.Lcd, hrows[MAX_ROWS - 1], 96, HINT_PX);
     for (uint8_t i = 0; i < shown; i++) {
-      M5.Lcd.setCursor(4, 38 + i * 10);
-      M5.Lcd.print(hrows[i]);
+      M5.Lcd.setCursor(4, 38 + i * UI_CJK_LH);
+      uiPrintUtf8(&M5.Lcd, hrows[i]);
     }
   }
 
@@ -1092,15 +1152,21 @@ void drawPet() {
   if (petPage == 0) drawPetStats(p);
   else drawPetHowTo(p);
 
-  // Header on top of whichever page drew — title left, counter right
-  spr.setTextSize(1);
-  spr.setTextColor(p.text, p.bg);
-  spr.setCursor(4, y + 2);
-  if (ownerName()[0]) {
-    spr.printf("%s's %s", ownerName(), petName());
-  } else {
-    spr.print(petName());
+  // Header on top of whichever page drew — owner/pet names may be UTF-8 so
+  // scope the CJK font to them; the "n/m" counter stays ASCII.
+  {
+    UiCjkFont uf(&spr);
+    spr.setTextColor(p.text, p.bg);
+    spr.setCursor(4, y + 2);
+    if (ownerName()[0]) {
+      char hdr[80];
+      snprintf(hdr, sizeof(hdr), "%s's %s", ownerName(), petName());
+      uiPrintUtf8(&spr, hdr);
+    } else {
+      uiPrintUtf8(&spr, petName());
+    }
   }
+  spr.setTextSize(1);
   spr.setTextColor(p.textDim, p.bg);
   spr.setCursor(W - 28, y + 2);
   spr.printf("%u/%u", petPage + 1, PET_PAGES);
@@ -1113,43 +1179,51 @@ void drawHUD() {
     return;
   }
   const Palette& p = characterPalette();
-  const int SHOW = 3, LH = 8, WIDTH = 21;
+  // CJK font is 14px tall with 15px pitch. HUD spans y=146..240 (6
+  // rows + slack). Character body never extends below y=140 (GIFs
+  // bottom-out at 140, ASCII buddy 2× body is 60..140 with padding
+  // 140..164). HUD's fillRect into 146..240 only overwrites that
+  // padding band + the gap below the character, not ink.
+  const int SHOW = 6;
+  const int LH   = UI_CJK_LH;
   const int AREA = SHOW * LH + 4;
+  const uint16_t TEXT_PX = W - 8;
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
-  spr.setTextSize(1);
 
   if (tama.lineGen != lastLineGen) { msgScroll = 0; lastLineGen = tama.lineGen; wake(); }
+
+  UiCjkFont uf(&spr);
 
   if (tama.nLines == 0) {
     spr.setTextColor(p.text, p.bg);
     spr.setCursor(4, H - LH - 2);
-    spr.print(tama.msg);
+    uiPrintUtf8(&spr, tama.msg);
     return;
   }
 
-  // Wrap all transcript lines into a flat display buffer. Track which
-  // transcript index each display row came from, so we can dim older ones.
-  static char disp[32][24];
-  static uint8_t srcOf[32];
-  uint8_t nDisp = 0;
-  for (uint8_t i = 0; i < tama.nLines && nDisp < 32; i++) {
-    uint8_t got = wrapInto(tama.lines[i], (char*)&disp[nDisp], 24, 32 - nDisp, WIDTH);
-    for (uint8_t j = 0; j < got; j++) srcOf[nDisp + j] = i;
-    nDisp += got;
-  }
+  // HUD shows ONLY the latest stored entry. Bridge sends a transcript
+  // with multiple entries (user prompt, assistant response, a "done"
+  // summary); we wrap just the last one across the 6-row HUD window
+  // rather than mixing them, which keeps streaming-response updates
+  // readable and avoids reflow between prompt and response slots.
+  extern char (*g_hudDisp)[HUD_ROW_STRIDE];
+  if (!g_hudDisp) return;
+  char (*disp)[HUD_ROW_STRIDE] = g_hudDisp;
+  const char* latest = tama.lines[tama.nLines - 1];
+  uint8_t nDisp = uiWrapUtf8(&spr, latest, (char*)disp,
+                             HUD_ROW_STRIDE, HUD_MAX_ROWS, TEXT_PX);
 
   uint8_t maxBack = (nDisp > SHOW) ? (nDisp - SHOW) : 0;
   if (msgScroll > maxBack) msgScroll = maxBack;
 
   int end = (int)nDisp - msgScroll;
   int start = end - SHOW; if (start < 0) start = 0;
-  uint8_t newest = tama.nLines - 1;
   for (int i = 0; start + i < end; i++) {
-    uint8_t row = start + i;
-    bool fresh = (srcOf[row] == newest) && (msgScroll == 0);
-    spr.setTextColor(fresh ? p.text : p.textDim, p.bg);
+    // All rows belong to the same (latest) message — uniform color.
+    // Scrolled-back rows dim as a cue that newer content is below.
+    spr.setTextColor((msgScroll == 0) ? p.text : p.textDim, p.bg);
     spr.setCursor(4, H - AREA + 2 + i * LH);
-    spr.print(disp[row]);
+    uiPrintUtf8(&spr, disp[start + i]);
   }
   if (msgScroll > 0) {
     spr.setTextColor(p.body, p.bg);
@@ -1158,26 +1232,98 @@ void drawHUD() {
   }
 }
 
+#define BOOT_CHK(tag) do { \
+    bool ok_i = heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true); \
+    bool ok_p = heap_caps_check_integrity(MALLOC_CAP_SPIRAM,   true); \
+    Serial.printf("[boot] %s heap(int)=%s heap(psram)=%s\n", \
+                  tag, ok_i ? "ok" : "CORRUPT", ok_p ? "ok" : "CORRUPT"); \
+    Serial.flush(); \
+  } while (0)
+
 void setup() {
   Serial.begin(115200);
+  delay(200);  // let USB serial attach before the first diagnostic
+  // Pin the default malloc() path to internal SRAM. ESP32 + PSRAM heap
+  // has a cache race with NVS flash reads (which disable cache briefly)
+  // — when a transient default-malloc (Preferences internal, BLE init
+  // bookkeeping, …) spills into PSRAM during that window, the PSRAM
+  // free-list metadata gets clobbered. Our own code targets PSRAM
+  // explicitly via heap_caps_malloc(SPIRAM) / psAlloc, which bypasses
+  // this threshold.
+  heap_caps_malloc_extmem_enable(0x40000000);
+  Serial.printf("[boot] psram size=%u free=%u internal heap free=%u\n",
+                (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram(),
+                (unsigned)ESP.getFreeHeap());
+
+  // ─── Phase 1: every PSRAM allocation, BEFORE any flash read ─────
+  // Flash reads (NVS, LittleFS) briefly disable PSRAM cache on this
+  // chip. After the first such read, TLSF metadata on the PSRAM heap
+  // becomes unsafe to walk, and any later psAlloc crashes inside the
+  // allocator. Front-load all PSRAM demands here so later code never
+  // touches the PSRAM heap's bookkeeping.
+  tamaInit(&tama);
+  characterPreallocTables();   // textStates + gifPaths
+  dataPrealloc();              // USB+BT line buffers
+  hudPrealloc();               // transcript display scratch
+  psArenaInit(32 * 1024);      // runtime JSON arena
+  g_askJsonCap = 4096;
+  g_askJsonBuf = (char*)psAlloc(g_askJsonCap);
+  // Snapshot PSRAM stats before the heap goes bad. Info pages use these.
+  g_psramTotalCached = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  g_psramFreeAtBoot  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  Serial.printf("[boot] psram arena=%uB askJsonBuf=%uB total=%u freeAtBoot=%u\n",
+                (unsigned)psArenaCapacity(), (unsigned)g_askJsonCap,
+                (unsigned)g_psramTotalCached, (unsigned)g_psramFreeAtBoot);
+
+  // ─── Phase 2: hardware / flash-backed init ───────────────────────
   auto cfg = M5.config();
   StickCP2.begin(cfg);
   M5.Lcd.setRotation(0);
   M5.Imu.begin();
   M5.Speaker.begin();
-  startBt();
+
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);   // off
-  applyBrightness();
   lastInteractMs = millis();
   statsLoad();
   settingsLoad();
+  uiSetCjkRoute(settings().cjkJa, settings().cjkCn, settings().cjkKr);
   petNameLoad();
   buddyInit();
+  applyBrightness();
 
-  // BLE stays always-on; s.bt is stored as a preference only.
+  // Sprite stays in DMA-capable internal SRAM. Trying to route the 64 KB
+  // RGB565 buffer to PSRAM corrupts the PSRAM heap's TLSF metadata on
+  // this chip (the exact mechanism is unclear — possibly the large
+  // contiguous allocation triggers a cache invalidation race). With BLE
+  // not yet started we have ~200 KB internal free; 64 KB fits easily.
+  spr.setPsram(false);
   spr.createSprite(W, H);
-  characterInit(nullptr);  // scan /characters/ for whatever is installed
+  Serial.printf("[boot] psram free=%u heap free=%u\n",
+                (unsigned)ESP.getFreePsram(), (unsigned)ESP.getFreeHeap());
+  // characterInit reads manifest.json from LittleFS. Tables were
+  // pre-allocated in Phase 1; this call only fills them.
+  characterInit(nullptr);
+
+  // Flip the UART kill switch. After startBt() the UART driver's
+  // tx_mux is zeroed by Bluedroid/NimBLE init on this chip/framework
+  // combo (arduino-esp32 3.x + PSRAM). All downstream Serial output
+  // goes through LOG_* macros that no-op when g_uartAlive is false.
+  Serial.flush();
+  g_uartAlive = false;
+  startBt();
+  // Probe (ets_printf bypasses the dead UART): confirm the arena is
+  // still functional post-BLE. Allocating from the arena doesn't walk
+  // the corrupted PSRAM heap free-list.
+  void* p1 = psArenaAlloc(1024);
+  ROMLOGF("[probe] arena alloc 1024 -> %p  used=%u\n",
+          p1, (unsigned)psArenaUsed());
+  psArenaReset();
+  ROMLOGF("[probe] arena reset, used=%u\n", (unsigned)psArenaUsed());
+  // ─── Post-BLE: PSRAM heap is poisoned at the free-list level. ────
+  // Existing PSRAM allocations still work; new ones must not happen.
+  // All runtime malloc/free goes through the internal heap instead.
+
   gifAvailable = characterLoaded();
   // species NVS: 0..N-1 = ASCII species, 0xFF = use GIF (also the default,
   // so a fresh install lands on the GIF). With no GIF installed, 0xFF falls
@@ -1189,14 +1335,24 @@ void setup() {
     const Palette& p = characterPalette();
     spr.fillSprite(p.bg);
     spr.setTextDatum(MC_DATUM);
-    spr.setTextSize(2);
     if (ownerName()[0]) {
+      // Owner / pet names may be UTF-8 — route per-codepoint through the
+      // CJK fonts at 2x for prominence. drawString can't route, so we
+      // measure+setCursor manually to center-align.
+      UiCjkFont uf(&spr);
+      spr.setTextSize(2);
       char line[40];
       snprintf(line, sizeof(line), "%s's", ownerName());
-      spr.setTextColor(p.text, p.bg);   spr.drawString(line, W/2, H/2 - 12);
-      spr.setTextColor(p.body, p.bg);   spr.drawString(petName(), W/2, H/2 + 12);
+      const int GLYPH_H = UI_CJK_LH * 2;
+      spr.setTextColor(p.text, p.bg);
+      spr.setCursor(W/2 - uiTextWidthUtf8(&spr, line) / 2, (H/2 - 16) - GLYPH_H/2);
+      uiPrintUtf8(&spr, line);
+      spr.setTextColor(p.body, p.bg);
+      spr.setCursor(W/2 - uiTextWidthUtf8(&spr, petName()) / 2, (H/2 + 16) - GLYPH_H/2);
+      uiPrintUtf8(&spr, petName());
     } else {
       // First boot, no owner pushed yet — say hi.
+      spr.setTextSize(2);
       spr.setTextColor(p.body, p.bg);   spr.drawString("Hello!", W/2, H/2 - 12);
       spr.setTextSize(1);
       spr.setTextColor(p.textDim, p.bg);
@@ -1207,7 +1363,7 @@ void setup() {
     delay(1800);
   }
 
-  Serial.printf("buddy: %s\n", buddyMode ? "ASCII mode" : "GIF character loaded");
+  // Setup complete. No Serial output — UART is unusable post-BLE init.
 }
 
 void loop() {
@@ -1215,6 +1371,7 @@ void loop() {
   t++;
   uint32_t now = millis();
 
+  bleDrainEvents();     // no-ops silently once UART is dead
   dataPoll(&tama);
   if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 3000);
   baseState = derive(tama);
@@ -1238,7 +1395,7 @@ void loop() {
     if (!menuOpen && !screenOff && checkShake() && (int32_t)(now - oneShotUntil) >= 0) {
       wake();
       triggerOneShot(P_DIZZY, 2000);
-      Serial.println("shake: dizzy");
+      LOGLN("shake: dizzy");
     }
   }
 
@@ -1297,13 +1454,13 @@ void loop() {
       menuSel = 0;
       if (!menuOpen) characterInvalidate();
     }
-    Serial.println(menuOpen ? "menu open" : "menu close");
+    LOGLN(menuOpen ? "menu open" : "menu close");
   }
   if (M5.BtnA.wasReleased()) {
     if (!btnALong && !swallowBtnA) {
       if (inPrompt && promptIsAsk()) {
         // AskUserQuestion: cycle through options. Sending happens on B.
-        JsonDocument d;
+        JsonDocument d;   // runtime parse → internal heap
         if (deserializeJson(d, tama.askJson) == DeserializationError::Ok) {
           uint8_t cnt = d[0]["options"].size();
           if (cnt > 0) askSel = (askSel + 1) % cnt;
@@ -1338,9 +1495,30 @@ void loop() {
     swallowBtnA = false;
   }
 
-  // BtnB: pet → heart
-  if (M5.BtnB.wasPressed()) {
-    if (swallowBtnB) { swallowBtnB = false; }
+  // BtnB long-press → reverse-scroll the HUD transcript. Short-press
+  // (below, on release) steps msgScroll forward; holding B rolls it
+  // back toward the newest line at ~5 Hz. Only active in the normal
+  // HUD context; in menus / prompts / info pages the release path
+  // runs normally (we don't set btnBLong, so it doesn't swallow).
+  {
+    static uint32_t _btnBScrollAt = 0;
+    bool inHud = !inPrompt && !menuOpen && !settingsOpen && !resetOpen
+               && displayMode == DISP_NORMAL;
+    if (inHud && !swallowBtnB && M5.BtnB.pressedFor(600)) {
+      uint32_t now = millis();
+      if (now - _btnBScrollAt >= 200) {
+        btnBLong = true;
+        if (msgScroll > 0) { msgScroll--; beep(1400, 20); }
+        _btnBScrollAt = now;
+      }
+    }
+  }
+
+  // BtnB release: short-press → confirm / scroll-forward / page, depending
+  // on context. Skipped if the long-press scroll-back ran (btnBLong).
+  if (M5.BtnB.wasReleased()) {
+    if (swallowBtnB) { swallowBtnB = false; btnBLong = false; }
+    else if (btnBLong) { btnBLong = false; }
     else
     if (inPrompt && promptIsAsk()) {
       // AskUserQuestion confirm. The Hardware Buddy BLE bridge in
@@ -1385,7 +1563,10 @@ void loop() {
       applyDisplayMode();
     } else {
       beep(2400, 30);
-      msgScroll = (msgScroll >= 30) ? 0 : msgScroll + 1;
+      // Cap at HUD_MAX_ROWS - 1; drawHUD clamps msgScroll to maxBack
+      // anyway so stepping one past the actual bottom just wraps on
+      // the next press.
+      msgScroll = (msgScroll >= HUD_MAX_ROWS - 1) ? 0 : msgScroll + 1;
     }
   }
 

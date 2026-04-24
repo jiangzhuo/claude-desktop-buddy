@@ -182,10 +182,13 @@ struct Settings {
   bool wifi;     // placeholder — no WiFi stack linked yet, just stores the pref
   bool led;
   bool hud;
+  bool cjkJa;    // route Hiragana/Katakana/Kanji to efontJA at render time
+  bool cjkCn;    // route CJK Unified Ideographs to efontCN
+  bool cjkKr;    // route Hangul to efontKR
   uint8_t clockRot;  // 0=auto 1=portrait 2=landscape
 };
 
-static Settings _settings = { true, true, false, true, true, 0 };
+static Settings _settings = { true, true, false, true, true, true, true, true, 0 };
 
 inline void settingsLoad() {
   _prefs.begin("buddy", true);
@@ -194,6 +197,9 @@ inline void settingsLoad() {
   _settings.wifi  = _prefs.getBool("s_wifi",false);
   _settings.led   = _prefs.getBool("s_led", true);
   _settings.hud      = _prefs.getBool("s_hud", true);
+  _settings.cjkJa    = _prefs.getBool("s_cjkja", true);
+  _settings.cjkCn    = _prefs.getBool("s_cjkcn", true);
+  _settings.cjkKr    = _prefs.getBool("s_cjkkr", true);
   _settings.clockRot = _prefs.getUChar("s_crot", 0);
   if (_settings.clockRot > 2) _settings.clockRot = 0;
   _prefs.end();
@@ -206,6 +212,9 @@ inline void settingsSave() {
   _prefs.putBool("s_wifi",_settings.wifi);
   _prefs.putBool("s_led", _settings.led);
   _prefs.putBool("s_hud", _settings.hud);
+  _prefs.putBool("s_cjkja", _settings.cjkJa);
+  _prefs.putBool("s_cjkcn", _settings.cjkCn);
+  _prefs.putBool("s_cjkkr", _settings.cjkKr);
   _prefs.putUChar("s_crot", _settings.clockRot);
   _prefs.end();
 }
